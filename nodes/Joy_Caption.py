@@ -8,12 +8,8 @@ import torch.amp.autocast_mode
 from model_management import get_torch_device
 import folder_paths
 
-BASE_COMFYDEPLOY_PATH = "/comfyui/models/"
-DEVICE = get_torch_device()
-
-
 def download_hg_model(model_id:str,exDir:str=''):
-    model_checkpoint = os.path.join(folder_paths.models_dir, BASE_COMFYDEPLOY_PATH, exDir, os.path.basename(model_id))
+    model_checkpoint = os.path.join(folder_paths.models_dir, exDir, os.path.basename(model_id))
     if not os.path.exists(model_checkpoint):
         from huggingface_hub import snapshot_download
         snapshot_download(repo_id=model_id, local_dir=model_checkpoint, local_dir_use_symlinks=False)
@@ -63,7 +59,6 @@ class Joy_caption_load:
         return {
             "required": {
                 "model": (["unsloth/Meta-Llama-3.1-8B-bnb-4bit", "meta-llama/Meta-Llama-3.1-8B"],), 
-               
             }
         }
 
@@ -72,6 +67,7 @@ class Joy_caption_load:
     FUNCTION = "gen"
 
     def loadCheckPoint(self):
+        device = get_torch_device()
         # 清除一波
         if self.pipeline != None:
             self.pipeline.clearCache() 
@@ -80,7 +76,7 @@ class Joy_caption_load:
         model_id = "google/siglip-so400m-patch14-384"
         CLIP_PATH = download_hg_model(model_id, "clip")
 
-        clip_processor = AutoProcessor.from_pretrained(CLIP_PATH) 
+        clip_processor = AutoProcessor.from_pretrained(CLIP_PATH, use_fast=True) 
         clip_model = AutoModel.from_pretrained(
                 CLIP_PATH,
                 trust_remote_code=True
@@ -89,12 +85,13 @@ class Joy_caption_load:
         clip_model = clip_model.vision_model
         clip_model.eval()
         clip_model.requires_grad_(False)
-        clip_model.to("cuda")
+        clip_model.to(device)
 
        
         # LLM
         MODEL_PATH = download_hg_model(self.model, "LLM")
-        tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH,use_fast=False)
+        
+        tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH, use_fast=False)
         assert isinstance(tokenizer, PreTrainedTokenizer) or isinstance(tokenizer, PreTrainedTokenizerFast), f"Tokenizer is of type {type(tokenizer)}"
 
         text_model = AutoModelForCausalLM.from_pretrained(MODEL_PATH, device_map="auto",trust_remote_code=True)
@@ -107,7 +104,7 @@ class Joy_caption_load:
         image_adapter.load_state_dict(torch.load(adapter_path, map_location="cpu"))
         adjusted_adapter =  image_adapter #AdjustedImageAdapter(image_adapter, text_model.config.hidden_size)
         adjusted_adapter.eval()
-        adjusted_adapter.to("cuda")
+        adjusted_adapter.to(device)
 
         self.pipeline.clip_model = clip_model
         self.pipeline.clip_processor = clip_processor
@@ -147,6 +144,9 @@ class Joy_caption:
     RETURN_TYPES = ("STRING",)
     FUNCTION = "gen"
     def gen(self,joy_pipeline,image,prompt,max_new_tokens,temperature,cache): 
+        device = get_torch_device()
+        device_type = device.type
+
 
         if joy_pipeline.clip_processor == None :
             joy_pipeline.parent.loadCheckPoint()    
@@ -157,27 +157,27 @@ class Joy_caption:
         image_adapter = joy_pipeline.image_adapter
         text_model = joy_pipeline.text_model
 
-     
-
         input_image = tensor2pil(image)
 
         # Preprocess image
         pImge = clip_processor(images=input_image, return_tensors='pt').pixel_values
-        pImge = pImge.to(DEVICE)
+        pImge = pImge.to(device)
+
 
         # Tokenize the prompt
-        prompt = tokenizer.encode(prompt, return_tensors='pt', padding=False, truncation=False, add_special_tokens=False)
+        prompt_tokens = tokenizer.encode(prompt, return_tensors='pt', padding=False, truncation=False, add_special_tokens=False)
         # Embed image
-        with torch.amp.autocast_mode.autocast(DEVICE, enabled=True):
+        with torch.amp.autocast_mode.autocast(device_type, enabled=True):
             vision_outputs = clip_model(pixel_values=pImge, output_hidden_states=True)
             image_features = vision_outputs.hidden_states[-2]
             embedded_images = image_adapter(image_features)
-            embedded_images = embedded_images.to(DEVICE)
+            embedded_images = embedded_images.to(device)
 
         # Embed prompt
-        prompt_embeds = text_model.model.embed_tokens(prompt.to(DEVICE))
-        assert prompt_embeds.shape == (1, prompt.shape[1], text_model.config.hidden_size), f"Prompt shape is {prompt_embeds.shape}, expected {(1, prompt.shape[1], text_model.config.hidden_size)}"
-        embedded_bos = text_model.model.embed_tokens(torch.tensor([[tokenizer.bos_token_id]], device=text_model.device, dtype=torch.int64))   
+        prompt_embeds = text_model.model.embed_tokens(prompt_tokens.to(device))
+        assert prompt_embeds.shape == (1, prompt_tokens.shape[1], text_model.config.hidden_size), f"Prompt shape is {prompt_embeds.shape}, expected {(1, prompt_tokens.shape[1], text_model.config.hidden_size)}"
+        embedded_bos = text_model.model.embed_tokens(torch.tensor([[tokenizer.bos_token_id]], device=text_model.device, dtype=torch.int64))
+
 
         # Construct prompts
         inputs_embeds = torch.cat([
@@ -189,8 +189,8 @@ class Joy_caption:
         input_ids = torch.cat([
             torch.tensor([[tokenizer.bos_token_id]], dtype=torch.long),
             torch.zeros((1, embedded_images.shape[1]), dtype=torch.long),
-            prompt,
-        ], dim=1).to(DEVICE)
+            prompt_tokens,
+        ], dim=1).to(device)
         attention_mask = torch.ones_like(input_ids)
         
         generate_ids = text_model.generate(input_ids, inputs_embeds=inputs_embeds, attention_mask=attention_mask, max_new_tokens=max_new_tokens, do_sample=True, top_k=10, temperature=temperature, suppress_tokens=None)
